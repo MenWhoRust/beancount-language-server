@@ -140,6 +140,9 @@ pub(crate) fn references(
 }
 
 /// Provider function for `textDocument/rename`.
+///
+/// Renames the account under the cursor and, because beancount account names are
+/// hierarchical, every sub-account beneath it -- see [`find_account_matches`].
 #[allow(clippy::mutable_key_type)]
 pub(crate) fn rename(
     snapshot: LspServerStateSnapshot,
@@ -156,32 +159,36 @@ pub(crate) fn rename(
 
     let content = doc.content.clone();
     let position = params.text_document_position_params.position;
-    let Some(node_text) = node_text_at_position(tree, &content, position).with_context(|| {
+    // Account-only, so a client that skips `prepareRename` cannot prefix-match
+    // against some unrelated token.
+    let Some(node) = account_node_at_position(tree, &content, position).with_context(|| {
         format!(
-            "failed to get node text at position for uri: {}",
+            "failed to get account node at position for uri: {}",
             uri.as_str()
         )
     })?
     else {
         return Ok(None);
     };
+    let node_text = text_for_tree_sitter_node(&content, &node);
 
-    let locs = find_references(
+    let matches = find_account_matches(
         &snapshot.forest,
         &snapshot.open_docs,
         &snapshot.forest_content,
         &node_text,
+        true,
     );
     let new_name = params.new_name;
 
     // Group locations by URI string to avoid mutable key type warning
-    let mut grouped_locs: std::collections::HashMap<String, Vec<lsp_types::Location>> =
+    let mut grouped_locs: std::collections::HashMap<String, Vec<(lsp_types::Location, String)>> =
         std::collections::HashMap::new();
-    for loc in locs {
+    for (loc, matched) in matches {
         grouped_locs
             .entry(loc.uri.to_string())
             .or_default()
-            .push(loc);
+            .push((loc, matched));
     }
 
     let mut changes: std::collections::HashMap<lsp_types::Uri, Vec<lsp_types::TextEdit>> =
@@ -196,7 +203,15 @@ pub(crate) fn rename(
         };
         let mut edits: Vec<_> = locations
             .into_iter()
-            .map(|l| lsp_types::TextEdit::new(l.range, new_name.clone()))
+            .map(|(l, matched)| {
+                // Keep whatever sits below the renamed account: renaming `A:B`
+                // to `A:C` must rewrite `A:B:Sub` as `A:C:Sub`. `matched` starts
+                // with `node_text` by construction, so slicing at its byte
+                // length always lands on a char boundary; an exact match leaves
+                // an empty suffix.
+                let text = format!("{new_name}{}", &matched[node_text.len()..]);
+                lsp_types::TextEdit::new(l.range, text)
+            })
             .collect();
         // Send edits ordered from the back so we do not invalidate following positions.
         edits.sort_by_key(|edit| edit.range.start);
@@ -211,16 +226,39 @@ pub(crate) fn rename(
 }
 
 /// Find all references to a given text in the project using tree-sitter queries.
+///
+/// Exact matches only -- a sub-account is not a reference to its parent.
 fn find_references(
     forest: &HashMap<PathBuf, Arc<tree_sitter::Tree>>,
     open_docs: &HashMap<PathBuf, Document>,
     forest_content: &HashMap<PathBuf, Arc<Rope>>,
     node_text: &str,
 ) -> Vec<lsp_types::Location> {
+    find_account_matches(forest, open_docs, forest_content, node_text, false)
+        .into_iter()
+        .map(|(loc, _)| loc)
+        .collect()
+}
+
+/// Find every account node in the project whose text is NODE_TEXT or, when
+/// INCLUDE_SUBACCOUNTS, a `:`-separated descendant of it. Each hit carries the
+/// text that matched, which `rename` needs in order to preserve the part of the
+/// name below the account being renamed.
+///
+/// The trailing `:` in the prefix is load-bearing: testing `starts_with(node_text)`
+/// alone would also catch an unrelated sibling such as `Assets:CheckingOld`.
+fn find_account_matches(
+    forest: &HashMap<PathBuf, Arc<tree_sitter::Tree>>,
+    open_docs: &HashMap<PathBuf, Document>,
+    forest_content: &HashMap<PathBuf, Arc<Rope>>,
+    node_text: &str,
+    include_subaccounts: bool,
+) -> Vec<(lsp_types::Location, String)> {
     let query = query_cache::account_query();
     let capture_account = query
         .capture_index_for_name("account")
         .expect("account should be captured");
+    let child_prefix = format!("{node_text}:");
 
     forest
         .iter()
@@ -246,19 +284,23 @@ fn find_references(
             while let Some(m) = matches.next() {
                 if let Some(node) = m.nodes_for_capture_index(capture_account).next() {
                     let m_text = node.utf8_text(source).expect("");
-                    if m_text == node_text {
-                        results.push((url.clone(), rope.clone(), node));
+                    if m_text == node_text
+                        || (include_subaccounts && m_text.starts_with(&child_prefix))
+                    {
+                        results.push((url.clone(), rope.clone(), node, m_text.to_string()));
                     }
                 }
             }
 
             results
         })
-        .filter_map(|(url, rope, node): (PathBuf, Rope, tree_sitter::Node)| {
-            let uri = lsp_types::Uri::from_file_path(&url).ok()?;
-            let range = tree_sitter_node_to_lsp_range(&rope, &node);
-            Some(Location::new(uri, range))
-        })
+        .filter_map(
+            |(url, rope, node, m_text): (PathBuf, Rope, tree_sitter::Node, String)| {
+                let uri = lsp_types::Uri::from_file_path(&url).ok()?;
+                let range = tree_sitter_node_to_lsp_range(&rope, &node);
+                Some((Location::new(uri, range), m_text))
+            },
+        )
         .collect::<Vec<_>>()
 }
 
@@ -471,7 +513,7 @@ mod tests {
         assert_eq!(edits[1].new_text, "Assets:Bank");
     }
 
-    // ---- prepareRename -----------------------------------------------------
+    // ---- prepareRename + sub-account cascade -------------------------------
 
     /// Hierarchical fixture: a parent account, a sub-account of it, and a
     /// sibling whose name merely *starts with* the parent's.
@@ -487,6 +529,8 @@ mod tests {
 
     const PARENT: &str = "Assets:CurrentAssets:CheckingAccount";
     const CHILD: &str = "Assets:CurrentAssets:CheckingAccount:DebitOrders";
+    const SIBLING: &str = "Assets:CurrentAssets:CheckingAccountOld";
+    const NEW: &str = "Assets:CurrentAssets:TransactionalAccount";
 
     /// Position OFFSET characters into the first occurrence of NEEDLE on LINE.
     /// The fixtures are ASCII, so a byte offset is also the UTF-16 offset LSP wants.
@@ -570,6 +614,118 @@ mod tests {
                 "expected no rename at {position:?}"
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::mutable_key_type)]
+    fn test_rename_cascades_to_subaccounts() {
+        let state = TestState::new(HIER).unwrap();
+        let uri = lsp_types::Uri::from_file_path(&state.path).unwrap();
+        let result = rename(
+            state.snapshot,
+            lsp_types::RenameParams {
+                text_document_position_params: lsp_types::TextDocumentPositionParams {
+                    text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                    position: pos_in(HIER, 1, "CheckingAccount", 3),
+                },
+                new_name: NEW.to_string(),
+                work_done_progress_params: Default::default(),
+            },
+        )
+        .unwrap()
+        .expect("rename should produce edits");
+
+        let changes = result.changes.expect("changes");
+        let edits = changes.get(&uri).expect("edits for the fixture file");
+        let texts: Vec<&str> = edits.iter().map(|e| e.new_text.as_str()).collect();
+
+        // parent: open + posting. child: open + posting. sibling: untouched.
+        assert_eq!(edits.len(), 4, "unexpected edits: {texts:?}");
+        assert_eq!(texts.iter().filter(|t| **t == NEW).count(), 2);
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|t| **t == format!("{NEW}:DebitOrders"))
+                .count(),
+            2,
+            "sub-account must keep its suffix: {texts:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::mutable_key_type)]
+    fn test_rename_does_not_touch_prefix_sibling() {
+        // `Assets:...:CheckingAccountOld` starts with the renamed account but is
+        // NOT a sub-account of it. This is what the trailing `:` in
+        // `child_prefix` guards; without it this account would be rewritten as
+        // `...:TransactionalAccountOld`.
+        let state = TestState::new(HIER).unwrap();
+        let uri = lsp_types::Uri::from_file_path(&state.path).unwrap();
+        let sibling_start = pos_in(HIER, 3, SIBLING, 0);
+
+        let result = rename(
+            state.snapshot,
+            lsp_types::RenameParams {
+                text_document_position_params: lsp_types::TextDocumentPositionParams {
+                    text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                    position: pos_in(HIER, 1, "CheckingAccount", 3),
+                },
+                new_name: NEW.to_string(),
+                work_done_progress_params: Default::default(),
+            },
+        )
+        .unwrap()
+        .expect("rename should produce edits");
+
+        let changes = result.changes.expect("changes");
+        let edits = changes.get(&uri).expect("edits");
+        assert!(
+            edits.iter().all(|e| !e.new_text.ends_with("Old")),
+            "sibling was rewritten: {:?}",
+            edits.iter().map(|e| &e.new_text).collect::<Vec<_>>()
+        );
+        assert!(
+            edits.iter().all(|e| e.range.start != sibling_start),
+            "an edit landed on the prefix sibling"
+        );
+    }
+
+    #[test]
+    fn test_find_account_matches_include_subaccounts() {
+        let state = TestState::new(HIER).unwrap();
+        let matches = find_account_matches(
+            &state.snapshot.forest,
+            &state.snapshot.open_docs,
+            &state.snapshot.forest_content,
+            PARENT,
+            true,
+        );
+        let mut texts: Vec<String> = matches.into_iter().map(|(_, t)| t).collect();
+        texts.sort();
+        // Sorted: PARENT is a prefix of CHILD, so it orders first.
+        assert_eq!(
+            texts,
+            vec![
+                PARENT.to_string(),
+                PARENT.to_string(),
+                CHILD.to_string(),
+                CHILD.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_find_references_excludes_subaccounts() {
+        // `textDocument/references` semantics are unchanged by the cascade: a
+        // sub-account is not a reference to its parent.
+        let state = TestState::new(HIER).unwrap();
+        let locs = find_references(
+            &state.snapshot.forest,
+            &state.snapshot.open_docs,
+            &state.snapshot.forest_content,
+            PARENT,
+        );
+        assert_eq!(locs.len(), 2); // open + posting only
     }
 
     #[test]
