@@ -329,6 +329,17 @@ impl DocumentStore {
         self.forest.get(uri)
     }
 
+    /// Text for URI as a `String`, or `None` if the store has no content for it.
+    ///
+    /// Honours the same precedence as the rest of the store: an open buffer wins
+    /// over `forest_content`, so this always pairs with [`Self::get_tree`].
+    pub(crate) fn get_text(&self, uri: &PathBuf) -> Option<String> {
+        if let Some(doc) = self.open_docs.get(uri) {
+            return Some(doc.content.to_string());
+        }
+        self.forest_content.get(uri).map(|rope| rope.to_string())
+    }
+
     pub(crate) fn has_open_doc(&self, uri: &PathBuf) -> bool {
         self.open_docs.contains_key(uri)
     }
