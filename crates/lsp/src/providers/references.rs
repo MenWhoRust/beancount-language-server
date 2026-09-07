@@ -14,6 +14,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tracing::debug;
 use tree_sitter::StreamingIterator;
+use tree_sitter_beancount::NodeKind;
 use tree_sitter_beancount::tree_sitter;
 
 fn node_text_at_position(
@@ -30,6 +31,76 @@ fn node_text_at_position(
     };
 
     Ok(Some(text_for_tree_sitter_node(content, &node)))
+}
+
+/// Resolve the `account` node at POSITION, if the position is on one.
+///
+/// Two point ranges are tried, because no single one covers both ends of the
+/// token. The widened `pos-1..pos` range from
+/// `lsp_position_to_tree_sitter_point_range` resolves a cursor sitting just past
+/// the end of the account, but on the account's FIRST character it reaches back
+/// into the preceding whitespace and yields the enclosing `posting`/`open`
+/// instead; the exact point covers that case. A cursor resting on the first
+/// character is the normal state in a modal editor, so it has to work.
+fn account_node_at_position<'t>(
+    tree: &'t tree_sitter::Tree,
+    content: &Rope,
+    position: lsp_types::Position,
+) -> Result<Option<tree_sitter::Node<'t>>> {
+    let (wide_start, point) = lsp_position_to_tree_sitter_point_range(content, position)?;
+    for (start, end) in [(wide_start, point), (point, point)] {
+        if let Some(node) = tree
+            .root_node()
+            .named_descendant_for_point_range(start, end)
+            && NodeKind::Account == node.kind().into()
+        {
+            return Ok(Some(node));
+        }
+    }
+    Ok(None)
+}
+
+/// Provider function for `textDocument/prepareRename`.
+///
+/// Tells the client the exact range it should offer for editing instead of
+/// letting it guess. Guessing is what broke account renames: a client that falls
+/// back to its own word/symbol notion stops at the `:` separators and offers
+/// only the last segment, while `rename` below replaces the whole account -- so
+/// accepting the prompt silently truncated `Assets:CurrentAssets:Checking` to
+/// `Checking`.
+pub(crate) fn prepare_rename(
+    snapshot: LspServerStateSnapshot,
+    params: lsp_types::PrepareRenameParams,
+) -> Result<Option<lsp_types::PrepareRenameResult>> {
+    let uri = &params.text_document_position_params.text_document.uri;
+    let (tree, doc) = match snapshot.tree_and_document_for_uri(uri) {
+        Ok(v) => v,
+        Err(e) => {
+            debug!("PrepareRename: failed to get tree/document for uri: {e}");
+            return Ok(None);
+        }
+    };
+
+    let content = doc.content.clone();
+    let position = params.text_document_position_params.position;
+    let Some(node) = account_node_at_position(tree, &content, position).with_context(|| {
+        format!(
+            "failed to get account node at position for uri: {}",
+            uri.as_str()
+        )
+    })?
+    else {
+        // Not on an account. `None` rather than an error is what the spec asks
+        // for, and lets the client refuse up front instead of running a rename
+        // that would match nothing.
+        return Ok(None);
+    };
+
+    let range = tree_sitter_node_to_lsp_range(&content, &node);
+    let placeholder = text_for_tree_sitter_node(&content, &node);
+    Ok(Some(
+        lsp_types::PrepareRenamePlaceholder::new(range, placeholder).into(),
+    ))
 }
 
 /// Provider function for `textDocument/references`.
@@ -398,6 +469,119 @@ mod tests {
         assert_eq!(edits.len(), 2); // Rename in both locations
         assert_eq!(edits[0].new_text, "Assets:Bank");
         assert_eq!(edits[1].new_text, "Assets:Bank");
+    }
+
+    // ---- prepareRename -----------------------------------------------------
+
+    /// Hierarchical fixture: a parent account, a sub-account of it, and a
+    /// sibling whose name merely *starts with* the parent's.
+    const HIER: &str = r#"
+2024-01-01 open Assets:CurrentAssets:CheckingAccount
+2024-01-01 open Assets:CurrentAssets:CheckingAccount:DebitOrders
+2024-01-01 open Assets:CurrentAssets:CheckingAccountOld
+2024-01-02 * "Test"
+  Assets:CurrentAssets:CheckingAccount  100.00 USD
+  Assets:CurrentAssets:CheckingAccount:DebitOrders  -60.00 USD
+  Assets:CurrentAssets:CheckingAccountOld  -40.00 USD
+"#;
+
+    const PARENT: &str = "Assets:CurrentAssets:CheckingAccount";
+    const CHILD: &str = "Assets:CurrentAssets:CheckingAccount:DebitOrders";
+
+    /// Position OFFSET characters into the first occurrence of NEEDLE on LINE.
+    /// The fixtures are ASCII, so a byte offset is also the UTF-16 offset LSP wants.
+    fn pos_in(content: &str, line: u32, needle: &str, offset: u32) -> lsp_types::Position {
+        let text = content.lines().nth(line as usize).expect("line exists");
+        let col = text.find(needle).expect("needle on line") as u32;
+        lsp_types::Position {
+            line,
+            character: col + offset,
+        }
+    }
+
+    fn prepare_rename_at(
+        content: &str,
+        position: lsp_types::Position,
+    ) -> Option<lsp_types::PrepareRenameResult> {
+        let state = TestState::new(content).unwrap();
+        let uri = lsp_types::Uri::from_file_path(&state.path).unwrap();
+        prepare_rename(
+            state.snapshot,
+            lsp_types::PrepareRenameParams {
+                work_done_progress_params: Default::default(),
+                text_document_position_params: lsp_types::TextDocumentPositionParams {
+                    text_document: lsp_types::TextDocumentIdentifier { uri },
+                    position,
+                },
+            },
+        )
+        .unwrap()
+    }
+
+    fn assert_prepares_to_parent(position: lsp_types::Position) {
+        let result = prepare_rename_at(HIER, position).expect("should be renameable");
+        match result {
+            lsp_types::PrepareRenameResult::PrepareRenamePlaceholder(p) => {
+                // The placeholder is the FULL dotted account, not the last
+                // `:`-separated segment -- the whole point of the provider.
+                assert_eq!(p.placeholder, PARENT);
+                assert_eq!(p.range.start, pos_in(HIER, 1, PARENT, 0));
+                assert_eq!(p.range.end, pos_in(HIER, 1, PARENT, PARENT.len() as u32));
+            }
+            other => panic!("expected a placeholder result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_prepare_rename_mid_segment_spans_full_account() {
+        // Cursor inside the LAST segment -- where a client guessing with its own
+        // word/symbol notion would offer only "CheckingAccount".
+        assert_prepares_to_parent(pos_in(HIER, 1, "CheckingAccount", 3));
+    }
+
+    #[test]
+    fn test_prepare_rename_at_first_character() {
+        // Regression: the widened `pos-1..pos` point range reaches back into the
+        // preceding whitespace here and resolves the `open` ancestor, so the
+        // exact-point retry in `account_node_at_position` is what makes this
+        // work. A cursor resting on the first character is normal in a modal
+        // editor.
+        assert_prepares_to_parent(pos_in(HIER, 1, PARENT, 0));
+    }
+
+    #[test]
+    fn test_prepare_rename_mid_segment_of_first_component() {
+        assert_prepares_to_parent(pos_in(HIER, 1, PARENT, 3));
+    }
+
+    #[test]
+    fn test_prepare_rename_rejects_non_accounts() {
+        // A date, a currency and a narration string are all renameable-looking
+        // tokens that must be refused. `currency` matters most: it is lexically
+        // account-like, and rename on one used to return an empty edit set,
+        // which reads as "the command did nothing".
+        for position in [
+            pos_in(HIER, 1, "2024", 2), // date
+            pos_in(HIER, 5, "USD", 1),  // currency
+            pos_in(HIER, 4, "Test", 1), // narration string
+        ] {
+            assert!(
+                prepare_rename_at(HIER, position).is_none(),
+                "expected no rename at {position:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_prepare_rename_on_subaccount_uses_full_child_name() {
+        let result = prepare_rename_at(HIER, pos_in(HIER, 2, "DebitOrders", 2))
+            .expect("sub-account should be renameable");
+        match result {
+            lsp_types::PrepareRenameResult::PrepareRenamePlaceholder(p) => {
+                assert_eq!(p.placeholder, CHILD);
+            }
+            other => panic!("expected a placeholder result, got {other:?}"),
+        }
     }
 
     #[test]
