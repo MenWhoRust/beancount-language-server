@@ -41,6 +41,23 @@ struct PostingAmount {
     cost: Option<Cost>,
 }
 
+/// Apply the sign of a posting's units to a stated total cost/price.
+///
+/// Beancount states a total (`@@` / `{{...}}`) as an absolute value -- a
+/// negative one is a parse error ("Negative prices are not allowed"). The
+/// weight of the posting therefore takes its sign from the units, so
+/// `-0.1444 AGBC @@ 29.28 ZAR` weighs -29.28 ZAR, not +29.28.
+fn signed_total(
+    units: rust_decimal::Decimal,
+    total: rust_decimal::Decimal,
+) -> rust_decimal::Decimal {
+    if units.is_sign_negative() {
+        -total.abs()
+    } else {
+        total.abs()
+    }
+}
+
 impl PostingAmount {
     /// Convert this posting amount to a specific currency if price or cost is specified
     fn convert_to_currency(&self) -> Option<(rust_decimal::Decimal, String)> {
@@ -48,8 +65,8 @@ impl PostingAmount {
         if let Some(cost) = &self.cost {
             // Cost is specified, convert to the cost currency
             let converted_value = if cost.is_total {
-                // {{total}} means total cost, use the cost amount directly
-                cost.amount.value
+                // {{total}} means total cost; the weight follows the units' sign
+                signed_total(self.amount.value, cost.amount.value)
             } else {
                 // {unit} means unit cost, multiply by quantity
                 self.amount.value * cost.amount.value
@@ -58,8 +75,8 @@ impl PostingAmount {
         } else if let Some(price) = &self.price {
             // Price is specified, convert to the price currency
             let converted_value = if price.is_total {
-                // @@ means total cost, use the price amount directly
-                price.amount.value
+                // @@ means total price; the weight follows the units' sign
+                signed_total(self.amount.value, price.amount.value)
             } else {
                 // @ means unit price, multiply by quantity
                 self.amount.value * price.amount.value
@@ -638,6 +655,81 @@ fn calculate_total_hint(postings: &[Posting], position: Position) -> Option<Inla
 
 #[cfg(test)]
 mod tests {
+
+    /// Regression: a total price/cost is stated as an absolute value (beancount
+    /// rejects a negative one), so a posting that REDUCES a holding must take
+    /// its weight's sign from the units. Previously `@@`/`{{...}}` used the
+    /// stated total verbatim, so a fee paid by selling units scored +total
+    /// instead of -total and a perfectly balanced transaction was reported as
+    /// off by exactly 2x the fee.
+    #[test]
+    fn test_total_price_on_negative_units_balances() {
+        let content = r#"2026-08-11 * "STANLIB" "Platform Service Charge"
+  Assets:Investments:Fund    -0.1444 AGBC @@ 29.28 ZAR
+  Expenses:Investment:Fees    29.28 ZAR
+"#;
+        assert!(
+            hints_for(content).is_empty(),
+            "balanced transaction should produce no total hint"
+        );
+    }
+
+    #[test]
+    fn test_total_cost_on_negative_units_balances() {
+        let content = r#"2026-08-11 * "Sale"
+  Assets:Broker:Stock    -10 GOOG {{5021.20 USD}}
+  Assets:Broker:Cash    5021.20 USD
+"#;
+        assert!(
+            hints_for(content).is_empty(),
+            "balanced transaction should produce no total hint"
+        );
+    }
+
+    #[test]
+    fn test_total_price_on_positive_units_still_balances() {
+        let content = r#"2026-06-01 * "STANLIB" "New Investments"
+  Assets:Investments:Fund    8.6884 AGBC @@ 1752.38 ZAR
+  Assets:Investments:Cash   -1752.38 ZAR
+"#;
+        assert!(
+            hints_for(content).is_empty(),
+            "balanced transaction should produce no total hint"
+        );
+    }
+
+    #[test]
+    fn test_genuinely_unbalanced_total_price_is_still_reported() {
+        let content = r#"2026-08-11 * "STANLIB" "Platform Service Charge"
+  Assets:Investments:Fund    -0.1444 AGBC @@ 29.28 ZAR
+  Expenses:Investment:Fees    30.00 ZAR
+"#;
+        let hints = hints_for(content);
+        assert!(
+            hints
+                .iter()
+                .any(|h| matches!(&h.label, Label::String(l) if l.contains("0.72"))),
+            "a real 0.72 imbalance should still be reported, got {:?}",
+            hints
+        );
+    }
+
+    /// Parse CONTENT's first transaction and return its hints.
+    fn hints_for(content: &str) -> Vec<InlayHint> {
+        let rope_content = ropey::Rope::from_str(content);
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_beancount::language())
+            .unwrap();
+        let tree = parser.parse(content, None).unwrap();
+        let txn_query =
+            tree_sitter::Query::new(&tree_sitter_beancount::language(), TRANSACTION_QUERY).unwrap();
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let content_bytes = content.as_bytes();
+        let mut matches = cursor.matches(&txn_query, tree.root_node(), content_bytes);
+        let qmatch = matches.next().expect("no transaction found");
+        process_transaction(&qmatch.captures[0].node, &rope_content).unwrap_or_default()
+    }
     use super::*;
 
     #[test]
