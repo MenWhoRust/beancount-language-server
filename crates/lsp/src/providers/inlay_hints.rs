@@ -20,6 +20,7 @@ const TRANSACTION_QUERY: &str = r#"
 struct Amount {
     value: rust_decimal::Decimal,
     currency: String,
+    grouped: bool, // source used comma thousands separators
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +57,43 @@ fn signed_total(
     } else {
         total.abs()
     }
+}
+
+/// Whether any amount in the transaction is written with thousands separators.
+fn uses_grouping(postings: &[Posting]) -> bool {
+    postings.iter().filter_map(|p| p.amount.as_ref()).any(|pa| {
+        pa.amount.grouped
+            || pa.price.as_ref().is_some_and(|p| p.amount.grouped)
+            || pa.cost.as_ref().is_some_and(|c| c.amount.grouped)
+    })
+}
+
+/// Format VALUE, inserting comma thousands separators when GROUPED.
+fn format_decimal(value: rust_decimal::Decimal, grouped: bool) -> String {
+    let text = value.to_string();
+    if !grouped {
+        return text;
+    }
+    let (sign, digits) = match text.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", text.as_str()),
+    };
+    let (int_part, frac_part) = match digits.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (digits, None),
+    };
+    let mut out = String::from(sign);
+    for (i, c) in int_part.chars().enumerate() {
+        if i > 0 && (int_part.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if let Some(frac) = frac_part {
+        out.push('.');
+        out.push_str(frac);
+    }
+    out
 }
 
 impl PostingAmount {
@@ -309,6 +347,7 @@ fn extract_amount_from_node(
 
     if !number_str.is_empty() && !currency_str.is_empty() {
         // Strip comma thousands separators before parsing (beancount allows them)
+        let grouped = number_str.contains(',');
         let number_str = number_str.replace(',', "");
         // Try to evaluate the expression if it's a calculation
         let value = if number_str.contains('*')
@@ -324,6 +363,7 @@ fn extract_amount_from_node(
         Some(Amount {
             value,
             currency: currency_str,
+            grouped,
         })
     } else {
         None
@@ -404,6 +444,7 @@ fn extract_compound_amount(
 
     if !number_str.is_empty() && !currency_str.is_empty() {
         // Strip comma thousands separators before parsing (beancount allows them)
+        let grouped = number_str.contains(',');
         let number_str = number_str.replace(',', "");
         // Try to evaluate the expression if it's a calculation
         let value = if number_str.contains('*')
@@ -419,6 +460,7 @@ fn extract_compound_amount(
         Some(Amount {
             value,
             currency: currency_str,
+            grouped,
         })
     } else {
         None
@@ -499,11 +541,12 @@ fn calculate_balancing_hint(postings: &[Posting]) -> Option<InlayHint> {
     }
 
     // Format the balancing amount(s) - just plain text, no comment markers
+    let grouped = uses_grouping(postings);
     let mut amounts: Vec<String> = totals
         .iter()
         .map(|(currency, value)| {
             let balancing = -value;
-            format!("{} {}", balancing, currency)
+            format!("{} {}", format_decimal(balancing, grouped), currency)
         })
         .collect();
     amounts.sort(); // For consistent output
@@ -627,9 +670,10 @@ fn calculate_total_hint(postings: &[Posting], position: Position) -> Option<Inla
     }
 
     // Format the unbalanced amounts
+    let grouped = uses_grouping(postings);
     let mut amounts: Vec<String> = unbalanced
         .iter()
-        .map(|(currency, value)| format!("{} {}", value, currency))
+        .map(|(currency, value)| format!("{} {}", format_decimal(**value, grouped), currency))
         .collect();
     amounts.sort(); // For consistent output
 
@@ -711,6 +755,89 @@ mod tests {
                 .any(|h| matches!(&h.label, Label::String(l) if l.contains("0.72"))),
             "a real 0.72 imbalance should still be reported, got {:?}",
             hints
+        );
+    }
+
+    fn labels_for(content: &str) -> Vec<String> {
+        hints_for(content)
+            .into_iter()
+            .filter_map(|h| match h.label {
+                Label::String(l) => Some(l),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_format_decimal_grouping() {
+        use rust_decimal::Decimal;
+        let d = |s: &str| Decimal::from_str_exact(s).unwrap();
+        assert_eq!(format_decimal(d("19987.73"), true), "19,987.73");
+        assert_eq!(format_decimal(d("-1234567.5"), true), "-1,234,567.5");
+        assert_eq!(format_decimal(d("999.99"), true), "999.99");
+        assert_eq!(format_decimal(d("-100"), true), "-100");
+        assert_eq!(format_decimal(d("1000"), true), "1,000");
+        assert_eq!(format_decimal(d("0.1444"), true), "0.1444");
+        assert_eq!(format_decimal(d("19987.73"), false), "19987.73");
+    }
+
+    #[test]
+    fn test_balancing_hint_mirrors_separators() {
+        let labels = labels_for(
+            r#"2026-08-01 * "Rent"
+  Expenses:Housing:Rent    19,987.73 ZAR
+  Assets:Bank:Cheque
+"#,
+        );
+        assert!(
+            labels.iter().any(|l| l.contains("-19,987.73 ZAR")),
+            "got {:?}",
+            labels
+        );
+    }
+
+    #[test]
+    fn test_balancing_hint_without_separators_stays_plain() {
+        let labels = labels_for(
+            r#"2026-08-01 * "Rent"
+  Expenses:Housing:Rent    19987.73 ZAR
+  Assets:Bank:Cheque
+"#,
+        );
+        assert!(
+            labels.iter().any(|l| l.contains("-19987.73 ZAR")),
+            "got {:?}",
+            labels
+        );
+    }
+
+    #[test]
+    fn test_total_hint_mirrors_separators() {
+        let labels = labels_for(
+            r#"2026-08-01 * "Transfer"
+  Assets:Bank:Savings     12,500.00 ZAR
+  Assets:Bank:Cheque     -11,000.00 ZAR
+"#,
+        );
+        assert!(
+            labels.iter().any(|l| l.contains("total = 1,500.00 ZAR")),
+            "got {:?}",
+            labels
+        );
+    }
+
+    #[test]
+    fn test_separator_on_price_enables_grouping() {
+        let labels = labels_for(
+            r#"2026-06-01 * "STANLIB" "New Investments"
+  Assets:Investments:Fund    8.6884 AGBC @@ 1,752.38 ZAR
+  Assets:Investments:Cash
+"#,
+        );
+        assert!(
+            labels.iter().any(|l| l.contains("-1,752.38 ZAR")),
+            "got {:?}",
+            labels
         );
     }
 
@@ -1609,10 +1736,10 @@ mod tests {
             let txn_node = qmatch.captures[0].node;
             let hints = process_transaction(&txn_node, &rope_content).unwrap();
 
-            // Should have a balancing hint showing -19987.73
+            // Should have a balancing hint mirroring the separators: -19,987.73
             let balancing_hint = hints.iter().find(|h| {
                 if let Label::String(label) = &h.label {
-                    label.contains("-19987.73")
+                    label.contains("-19,987.73")
                 } else {
                     false
                 }
