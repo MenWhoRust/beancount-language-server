@@ -70,6 +70,22 @@ pub(crate) fn extract_include_paths(
     source: &[u8],
     containing_file: &path::Path,
 ) -> HashSet<PathBuf> {
+    // A tree and a source that disagree on length cannot describe the same
+    // document, and slicing a node out of the shorter one panics inside
+    // tree-sitter. This runs on the main loop, so that panic takes the WHOLE
+    // server down -- refuse the query instead and let the caller carry on.
+    let root = tree.root_node();
+    if root.end_byte() > source.len() {
+        tracing::warn!(
+            "Skipping include extraction for {:?}: tree spans {} bytes but source is {} \
+             -- tree and source are out of sync",
+            containing_file,
+            root.end_byte(),
+            source.len()
+        );
+        return HashSet::new();
+    }
+
     let include_query = query_cache::include_query();
     let mut cursor_qry = tree_sitter::QueryCursor::new();
     let mut include_matches = cursor_qry.matches(include_query, tree.root_node(), source);
@@ -129,15 +145,20 @@ pub(crate) fn extract_include_paths(
 
 /// Parse all files reachable via `include` directives starting from `tree`/`file`.
 ///
+/// TEXT must be the source TREE was parsed from. It is a parameter rather than a
+/// fresh read of FILE because the two are not interchangeable: for a file open in
+/// the editor with unsaved edits, the buffer the tree came from and the bytes on
+/// disk differ, and querying the tree against the wrong one panics.
+///
 /// Calls `on_parsed` for each newly discovered file. Pre-populate `already_seen`
 /// with paths to skip (e.g. already loaded in DocumentStore).
 pub(crate) fn parse_reachable_includes(
     tree: &tree_sitter::Tree,
+    text: &str,
     file: &path::Path,
     already_seen: &mut HashSet<PathBuf>,
     on_parsed: &mut impl FnMut(PathBuf, tree_sitter::Tree, &str) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let text = fs::read_to_string(file)?;
     let include_paths = extract_include_paths(tree, text.as_bytes(), file);
     for path in include_paths {
         if already_seen.contains(&path) {
@@ -148,7 +169,7 @@ pub(crate) fn parse_reachable_includes(
             Ok(content) => {
                 if let Some(new_tree) = crate::treesitter_utils::parse_beancount(&content) {
                     on_parsed(path.clone(), new_tree.clone(), &content)?;
-                    parse_reachable_includes(&new_tree, &path, already_seen, on_parsed)?;
+                    parse_reachable_includes(&new_tree, &content, &path, already_seen, on_parsed)?;
                 }
             }
             Err(e) => {
@@ -838,6 +859,70 @@ include "{}"
         let tree = parse_beancount(text);
         let result = extract_include_paths(&tree, text.as_bytes(), path::Path::new("/root.bean"));
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_extract_include_paths_tree_longer_than_source_does_not_panic() {
+        // Regression: an editor buffer with unsaved edits is a different length
+        // from the file on disk. Pairing a tree parsed from the longer text with
+        // the shorter source used to panic inside `Node::utf8_text`
+        // ("range end index N out of range for slice of length M") -- on the main
+        // loop, so it killed the whole server and the client restarted it into
+        // the same crash on the next didOpen.
+        let buffer = "include \"/tmp/a-much-longer-name.bean\"\n";
+        let disk = "include \"/tmp/a.bean\"\n";
+        assert!(
+            buffer.len() > disk.len(),
+            "fixture must be longer than source"
+        );
+
+        let tree = parse_beancount(buffer);
+        let result = extract_include_paths(&tree, disk.as_bytes(), path::Path::new("/root.bean"));
+        assert!(
+            result.is_empty(),
+            "a mismatched tree/source pair must be refused, not queried"
+        );
+    }
+
+    #[test]
+    fn test_extract_include_paths_tree_shorter_than_source_still_works() {
+        // The guard must only reject the unsafe direction. A source LONGER than
+        // the tree is entirely in-bounds, so extraction must still happen.
+        let temp_dir = TempDir::new().unwrap();
+        let included = create_temp_file(&temp_dir, "included.bean", "");
+        let text = format!("include \"{}\"\n", included.to_str().unwrap());
+        let tree = parse_beancount(&text);
+
+        let padded = format!("{text}; trailing comment the tree never saw\n");
+        assert!(padded.len() > text.len());
+        let result = extract_include_paths(&tree, padded.as_bytes(), path::Path::new("/root.bean"));
+
+        assert_eq!(result.len(), 1);
+        assert!(result.contains(&included));
+    }
+
+    #[test]
+    fn test_parse_reachable_includes_uses_passed_text_not_disk() {
+        // `parse_reachable_includes` must query TEXT, not re-read FILE. Here the
+        // file on disk includes nothing while the passed-in text (standing in for
+        // an unsaved buffer) includes a real file -- so following the buffer is
+        // the observable behaviour.
+        let temp_dir = TempDir::new().unwrap();
+        let target = create_temp_file(&temp_dir, "target.bean", "2024-01-01 open Assets:A\n");
+        let root = create_temp_file(&temp_dir, "root.bean", "; nothing included on disk\n");
+
+        let buffer = format!("include \"{}\"\n", target.to_string_lossy());
+        let tree = parse_beancount(&buffer);
+
+        let mut seen = HashSet::new();
+        let mut parsed: Vec<PathBuf> = Vec::new();
+        parse_reachable_includes(&tree, &buffer, &root, &mut seen, &mut |path, _t, _c| {
+            parsed.push(path);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(parsed, vec![target], "should follow the buffer's include");
     }
 
     #[test]

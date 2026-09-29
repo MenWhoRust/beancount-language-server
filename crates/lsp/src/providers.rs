@@ -12,7 +12,8 @@ pub mod formatting;
 pub mod hover;
 /// Provider definitions for LSP `textDocument/inlayHint`.
 pub mod inlay_hints;
-/// Provider definitions for LSP `textDocument/references` and `textDocument/rename`.
+/// Provider definitions for LSP `textDocument/references`, `textDocument/rename`
+/// and `textDocument/prepareRename`.
 pub mod references;
 /// Provider definitions for LSP semantic tokens (syntax highlighting).
 pub mod semantic_tokens;

@@ -33,12 +33,21 @@ fn process_includes(
         None => return Ok(()),
     };
 
+    // Must be the text this tree was parsed from, NOT a fresh read of the file:
+    // an open buffer with unsaved edits differs from what is on disk, and running
+    // the include query against the mismatched source panics the main loop.
+    let text = match state.doc_store.get_text(file_path) {
+        Some(text) => text,
+        None => return Ok(()),
+    };
+
     // Pre-populate already_seen with files already in the forest to skip them.
     let known: Vec<PathBuf> = state.doc_store.forest_keys().cloned().collect();
     processed.extend(known);
 
     forest::parse_reachable_includes(
         &tree,
+        &text,
         file_path,
         processed,
         &mut |path, new_tree, content| {

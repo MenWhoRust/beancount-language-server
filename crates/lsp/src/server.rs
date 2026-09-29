@@ -517,6 +517,8 @@ impl LspServerState {
             .expect("Failed to register Formatting handler")
             .on::<lsp_types::RenameRequest>(references::rename)
             .expect("Failed to register Rename handler")
+            .on::<lsp_types::PrepareRenameRequest>(references::prepare_rename)
+            .expect("Failed to register PrepareRename handler")
             .on::<lsp_types::ReferencesRequest>(references::references)
             .expect("Failed to register References handler")
             .on::<lsp_types::DefinitionRequest>(definition::definition)

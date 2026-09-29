@@ -37,7 +37,7 @@ pub(crate) fn server_capabilities() -> ServerCapabilities {
         references_provider: Some(true.into()),
         rename_provider: Some(
             RenameOptions {
-                prepare_provider: Some(false),
+                prepare_provider: Some(true),
                 work_done_progress_options: WorkDoneProgressOptions {
                     work_done_progress: None,
                 },
@@ -231,8 +231,8 @@ mod tests {
             RenameProvider::RenameOptions(options) => {
                 assert_eq!(
                     options.prepare_provider,
-                    Some(false),
-                    "prepare_provider should be disabled"
+                    Some(true),
+                    "prepare_provider should be enabled"
                 );
             }
             _ => panic!("Expected RenameOptions"),
@@ -447,6 +447,18 @@ mod tests {
                 LspServerStateSnapshot,
                 lsp_types::RenameParams,
             ) -> anyhow::Result<Option<lsp_types::WorkspaceEdit>> = providers::references::rename;
+        }
+
+        // Prepare rename capability -> providers::references::prepare_rename
+        if let Some(RenameProvider::RenameOptions(opts)) = &caps.rename_provider
+            && opts.prepare_provider == Some(true)
+        {
+            let _handler: fn(
+                LspServerStateSnapshot,
+                lsp_types::PrepareRenameParams,
+            )
+                -> anyhow::Result<Option<lsp_types::PrepareRenameResult>> =
+                providers::references::prepare_rename;
         }
 
         // Semantic tokens capability -> providers::semantic_tokens::semantic_tokens_full
